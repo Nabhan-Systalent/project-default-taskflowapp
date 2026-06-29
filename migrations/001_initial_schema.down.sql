@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS "workspace";
+
+DROP TABLE IF EXISTS "project";
+
+DROP TABLE IF EXISTS "task";
+
+DROP TABLE IF EXISTS "user";
+
+DROP TABLE IF EXISTS "attachment";
