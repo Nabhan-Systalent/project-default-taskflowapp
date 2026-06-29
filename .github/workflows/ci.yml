@@ -1,0 +1,36 @@
+name: CI — b5b8ffc6-929e-4f9b-96d0-d989694660af
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+        # Dependency caching is intentionally NOT enabled here. actions/setup-node's
+        # `cache:` input fails the step ("Dependencies lock file is not found") when no
+        # package-lock.json / yarn.lock is committed — the normal state of a freshly
+        # generated repo. The install steps already fall back to `npm install` when no
+        # lockfile exists, so correctness does not depend on a cache.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Docker image
+        if: ${{ hashFiles('Dockerfile') != '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          # PR check only verifies the image builds (push: false), so a plain local
+          # tag is correct. Prefixing with an unset registry secret produced an
+          # invalid tag like "/name:sha" and failed the build.
+          tags: b5b8ffc6-929e-4f9b-96d0-d989694660af:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

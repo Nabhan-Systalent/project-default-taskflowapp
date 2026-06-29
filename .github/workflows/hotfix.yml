@@ -1,0 +1,179 @@
+name: Hotfix — b5b8ffc6-929e-4f9b-96d0-d989694660af
+
+on:
+  push:
+    branches: ['hotfix/*']
+
+permissions:
+  contents: write
+  deployments: write
+  packages: write
+
+env:
+  HOTFIX_DEPLOY_TIMEOUT_MIN: '30'
+
+jobs:
+  hotfix-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute automatic PATCH version increment
+        id: ver
+        run: |
+          LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          MAJOR=$(echo "$LAST" | sed 's/^v//' | cut -d. -f1)
+          MINOR=$(echo "$LAST" | sed 's/^v//' | cut -d. -f2)
+          PATCH=$(echo "$LAST" | sed 's/^v//' | cut -d. -f3)
+          NEXT="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "version=$NEXT" >> $GITHUB_OUTPUT
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [hotfix-version]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+        # Dependency caching is intentionally NOT enabled here. actions/setup-node's
+        # `cache:` input fails the step ("Dependencies lock file is not found") when no
+        # package-lock.json / yarn.lock is committed — the normal state of a freshly
+        # generated repo. The install steps already fall back to `npm install` when no
+        # lockfile exists, so correctness does not depend on a cache.
+      - run: npm ci
+      - run: npm run build
+
+  critical-tests:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+        # Dependency caching is intentionally NOT enabled here. actions/setup-node's
+        # `cache:` input fails the step ("Dependencies lock file is not found") when no
+        # package-lock.json / yarn.lock is committed — the normal state of a freshly
+        # generated repo. The install steps already fall back to `npm install` when no
+        # lockfile exists, so correctness does not depend on a cache.
+      - run: npm ci
+      - name: Run critical tests only
+        run: npm run test:critical
+
+  docker-build-push:
+    runs-on: ubuntu-latest
+    needs: [critical-tests, hotfix-version]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ghcr.io }}
+          username: ${{ github.actor }}
+          password: ${{ secrets. }}
+
+      - name: Build and push hotfix Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:hotfix-${{ needs.hotfix-version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [docker-build-push, hotfix-version]
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.8'
+          cli_config_credentials_token: ${{ secrets.VAULT_TOKEN }}
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: infra/terraform/envs/production
+        env:
+          TF_VAR_image_tag: hotfix-${{ needs.hotfix-version.outputs.version }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: infra/terraform/envs/production
+        env:
+          TF_VAR_image_tag: hotfix-${{ needs.hotfix-version.outputs.version }}
+
+      - name: Deploy hotfix image to production
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: b5b8ffc6-929e-4f9b-96d0-d989694660af-production
+          manifests: |
+            infra/k8s/overlays/production/
+          images: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:hotfix-${{ needs.hotfix-version.outputs.version }}
+
+      - name: Run smoke tests
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.PROD_URL }}
+
+  git-tag:
+    runs-on: ubuntu-latest
+    needs: [deploy-production, hotfix-version]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROD_DEPLOY_KEY }}
+
+      - name: Create and push hotfix tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a ${{ needs.hotfix-version.outputs.version }} -m "Hotfix ${{ needs.hotfix-version.outputs.version }}"
+          git push origin ${{ needs.hotfix-version.outputs.version }}
+
+  forward-merge:
+    runs-on: ubuntu-latest
+    needs: [git-tag, hotfix-version]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROD_DEPLOY_KEY }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Forward-merge hotfix commit to main
+        # Bind github.ref_name to an env var — branch names are attacker-controllable
+        # and direct shell interpolation is a script-injection vector
+        # (Semgrep run-shell-injection).
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          git fetch origin
+          git checkout main
+          git merge --no-ff "origin/${REF_NAME}" \
+            -m "chore: merge hotfix ${{ needs.hotfix-version.outputs.version }} to main [skip ci]"
+          git push origin main
+
+      - name: Forward-merge main to develop
+        run: |
+          git checkout develop
+          git merge --no-ff main \
+            -m "chore: forward-merge hotfix ${{ needs.hotfix-version.outputs.version }} to develop [skip ci]"
+          git push origin develop

@@ -1,0 +1,111 @@
+name: Release Candidate — b5b8ffc6-929e-4f9b-96d0-d989694660af
+
+on:
+  push:
+    branches: ['release/*']
+
+jobs:
+  extract-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Extract version from branch name
+        id: ver
+        run: echo "version=${GITHUB_REF#refs/heads/release/}" >> $GITHUB_OUTPUT
+
+  regression:
+    runs-on: ubuntu-latest
+    needs: [extract-version]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+        # Dependency caching is intentionally NOT enabled here. actions/setup-node's
+        # `cache:` input fails the step ("Dependencies lock file is not found") when no
+        # package-lock.json / yarn.lock is committed — the normal state of a freshly
+        # generated repo. The install steps already fall back to `npm install` when no
+        # lockfile exists, so correctness does not depend on a cache.
+      - run: npm ci
+      - run: npm test
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: |
+            coverage/
+            test-results/
+
+  performance:
+    runs-on: ubuntu-latest
+    needs: [regression]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run k6 performance tests
+        uses: grafana/k6-action@v0.3.1
+        with:
+          filename: tests/performance/load.js
+          flags: --out json=tests/performance/results/k6-results.json
+        env:
+          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}
+      - name: Upload performance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-report
+          path: tests/performance/results/
+
+  accessibility:
+    runs-on: ubuntu-latest
+    needs: [regression]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # DETECT_CHROMEDRIVER_VERSION pins ChromeDriver to the runner's Chrome;
+      # without it the latest chromedriver refuses to drive an older Chrome and
+      # the audit fails before it runs.
+      - run: DETECT_CHROMEDRIVER_VERSION=true npm install -g @axe-core/cli
+      - name: Run axe-core accessibility audit
+        run: |
+          axe ${{ vars.STAGING_URL }} --exit
+
+  dast:
+    runs-on: ubuntu-latest
+    needs: [regression]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run OWASP ZAP DAST scan
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          fail_action: true
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: report_html.html
+
+  docker-tag-rc:
+    runs-on: ubuntu-latest
+    needs: [extract-version, performance, accessibility, dast]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ghcr.io }}
+          username: ${{ github.actor }}
+          password: ${{ secrets. }}
+      - name: Build and push RC Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:rc-${{ needs.extract-version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
