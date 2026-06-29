@@ -1,0 +1,139 @@
+name: Rollback — b5b8ffc6-929e-4f9b-96d0-d989694660af
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Version tag to roll back to (e.g. v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate target version tag exists
+        # Bind the workflow input to an env var rather than interpolating the
+        # GitHub expression directly into the shell — direct interpolation is a
+        # script-injection vector (Semgrep run-shell-injection). Env vars are
+        # passed through the process environment, not the script source.
+        env:
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          if ! git rev-parse "${TARGET_VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag '${TARGET_VERSION}' not found in repository"
+            exit 1
+          fi
+          echo "Tag ${TARGET_VERSION} verified"
+
+      - name: Resolve target Docker image tag
+        id: resolve
+        env:
+          REGISTRY: ${{ secrets.ghcr.io }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          IMAGE="${REGISTRY}/b5b8ffc6-929e-4f9b-96d0-d989694660af:${TARGET_VERSION}"
+          if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "::error::Docker image not found for tag '${TARGET_VERSION}'"
+            exit 1
+          fi
+          echo "image_tag=${TARGET_VERSION}" >> $GITHUB_OUTPUT
+
+  rollback-deploy:
+    runs-on: ubuntu-latest
+    needs: [validate-version]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy rolled-back image
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: b5b8ffc6-929e-4f9b-96d0-d989694660af-production
+          manifests: |
+            infra/k8s/overlays/production/
+          images: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:${{ needs.validate-version.outputs.image_tag }}
+
+      - name: Health check validation
+        run: curl --fail --retry 10 --retry-delay 10 ${{ vars.PROD_URL }}/health
+
+      - name: Run smoke tests
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.PROD_URL }}
+
+  database-migrations:
+    runs-on: ubuntu-latest
+    needs: [rollback-deploy, validate-version]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_version }}
+
+      - name: Run down migrations for schema-mismatch rollback
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          echo "Running database down migrations to version ${TARGET_VERSION}"
+          if [ -f "scripts/db-rollback.sh" ]; then
+            bash scripts/db-rollback.sh "${TARGET_VERSION}"
+          else
+            echo "No db-rollback script found — skipping schema rollback (integrated with Database Agent in Phase 3)"
+          fi
+
+  update-monitoring:
+    runs-on: ubuntu-latest
+    needs: [rollback-deploy, validate-version]
+    steps:
+      - name: Update monitoring dashboards to reflect rolled-back version
+        env:
+          PAGERDUTY_KEY: ${{ secrets.PAGERDUTY_KEY }}
+          MONITORING_URL: ${{ vars.MONITORING_URL }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer $PAGERDUTY_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"version\":\"${TARGET_VERSION}\",\"status\":\"rollback\",\"service\":\"b5b8ffc6-929e-4f9b-96d0-d989694660af\"}" \
+            "${MONITORING_URL}/api/v1/deployments"
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [rollback-deploy, database-migrations, update-monitoring]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Notify Slack on rollback success
+        if: ${{ needs.rollback-deploy.result == 'success' }}
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets. }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "b5b8ffc6-929e-4f9b-96d0-d989694660af rollback to ${{ inputs.target_version }} succeeded on production"
+            }
+
+      - name: Notify Slack on rollback failure
+        if: ${{ needs.rollback-deploy.result == 'failure' }}
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets. }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "b5b8ffc6-929e-4f9b-96d0-d989694660af rollback to ${{ inputs.target_version }} FAILED on production"
+            }
