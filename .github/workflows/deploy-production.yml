@@ -1,0 +1,250 @@
+name: Deploy Production — b5b8ffc6-929e-4f9b-96d0-d989694660af
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  deployments: write
+  packages: write
+
+env:
+  ROLLBACK_ERROR_THRESHOLD: '0.05'
+
+jobs:
+  git-tag:
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROD_DEPLOY_KEY }}
+
+      - name: Compute next semantic version
+        id: tag
+        run: |
+          LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          MAJOR=$(echo "$LAST" | sed 's/^v//' | cut -d. -f1)
+          MINOR=$(echo "$LAST" | sed 's/^v//' | cut -d. -f2)
+          NEXT="v${MAJOR}.$((MINOR + 1)).0"
+          echo "version=$NEXT" >> $GITHUB_OUTPUT
+
+      - name: Create and push git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a ${{ steps.tag.outputs.version }} -m "Release ${{ steps.tag.outputs.version }}"
+          git push origin ${{ steps.tag.outputs.version }}
+
+  docker-tag-release:
+    runs-on: ubuntu-latest
+    needs: [git-tag]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ghcr.io }}
+          username: ${{ github.actor }}
+          password: ${{ secrets. }}
+
+      - name: Build and push release Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:${{ needs.git-tag.outputs.version }}
+            ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  terraform-apply:
+    runs-on: ubuntu-latest
+    needs: [docker-tag-release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.8'
+          cli_config_credentials_token: ${{ secrets.VAULT_TOKEN }}
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: infra/terraform/envs/production
+        env:
+          TF_VAR_image_tag: ${{ needs.git-tag.outputs.version }}
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+        working-directory: infra/terraform/envs/production
+        env:
+          TF_VAR_image_tag: ${{ needs.git-tag.outputs.version }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+        working-directory: infra/terraform/envs/production
+        env:
+          TF_VAR_image_tag: ${{ needs.git-tag.outputs.version }}
+
+  blue-green-deploy:
+    runs-on: ubuntu-latest
+    needs: [terraform-apply, git-tag]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy at 10% traffic
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: b5b8ffc6-929e-4f9b-96d0-d989694660af-production
+          strategy: blue-green
+          action: deploy
+          percentage: 10
+          manifests: |
+            infra/k8s/overlays/production/
+          images: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:${{ needs.git-tag.outputs.version }}
+
+      - name: Smoke tests at 10%
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.PROD_URL }}
+
+      - name: Ramp to 25% traffic
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: b5b8ffc6-929e-4f9b-96d0-d989694660af-production
+          strategy: blue-green
+          action: deploy
+          percentage: 25
+          manifests: |
+            infra/k8s/overlays/production/
+          images: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:${{ needs.git-tag.outputs.version }}
+
+      - name: Smoke tests at 25%
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.PROD_URL }}
+
+      - name: Ramp to 50% traffic
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: b5b8ffc6-929e-4f9b-96d0-d989694660af-production
+          strategy: blue-green
+          action: deploy
+          percentage: 50
+          manifests: |
+            infra/k8s/overlays/production/
+          images: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:${{ needs.git-tag.outputs.version }}
+
+      - name: Smoke tests at 50%
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.PROD_URL }}
+
+      - name: Ramp to 100% — full traffic promote
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: b5b8ffc6-929e-4f9b-96d0-d989694660af-production
+          strategy: blue-green
+          action: promote
+          manifests: |
+            infra/k8s/overlays/production/
+          images: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:${{ needs.git-tag.outputs.version }}
+
+      - name: Smoke tests at 100%
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.PROD_URL }}
+
+  smoke-tests:
+    runs-on: ubuntu-latest
+    needs: [blue-green-deploy, git-tag]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Full post-deploy smoke suite
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.PROD_URL }}
+
+      - name: Health check validation
+        run: curl --fail --retry 5 --retry-delay 10 ${{ vars.PROD_URL }}/health
+
+      - name: Post-deploy monitoring window (10 min)
+        env:
+          MONITORING_URL: ${{ vars.MONITORING_URL }}
+        run: |
+          echo "Monitoring error rate for 600 seconds (threshold: $ROLLBACK_ERROR_THRESHOLD)"
+          for i in $(seq 1 20); do
+            sleep 30
+            ERROR_RATE=$(curl -sf "${MONITORING_URL}/api/v1/query?query=http_error_rate" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['result'][0]['value'][1])" \
+              2>/dev/null || echo "0")
+            if python3 -c "import sys; sys.exit(0 if float('${ERROR_RATE}') <= float('$ROLLBACK_ERROR_THRESHOLD') else 1)"; then
+              echo "Iteration $i OK — error rate ${ERROR_RATE}"
+            else
+              echo "Error rate ${ERROR_RATE} breaches threshold $ROLLBACK_ERROR_THRESHOLD — rolling back"
+              kubectl rollout undo deployment/b5b8ffc6-929e-4f9b-96d0-d989694660af -n b5b8ffc6-929e-4f9b-96d0-d989694660af-production
+              exit 1
+            fi
+          done
+          echo "Monitoring window passed — deployment stable"
+
+  changelog-generation:
+    runs-on: ubuntu-latest
+    needs: [git-tag]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROD_DEPLOY_KEY }}
+
+      - name: Generate CHANGELOG.md from conventional commits
+        run: |
+          LAST_TAG=$(git tag --sort=-version:refname | sed -n '2p' || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="${LAST_TAG}..${{ needs.git-tag.outputs.version }}"
+          else
+            RANGE="${{ needs.git-tag.outputs.version }}"
+          fi
+          EXISTING=$(cat CHANGELOG.md 2>/dev/null | tail -n +3 || echo "")
+          {
+            echo "# Changelog"
+            echo ""
+            echo "## ${{ needs.git-tag.outputs.version }} ($(date -u +%Y-%m-%d))"
+            echo ""
+            git log $RANGE --pretty=format:"- %s" --no-merges
+            echo ""
+            echo ""
+            echo "$EXISTING"
+          } > CHANGELOG.md
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git diff --staged --quiet || git commit -m "docs: update CHANGELOG for ${{ needs.git-tag.outputs.version }} [skip ci]"
+          git push
+
+  github-release-publish:
+    runs-on: ubuntu-latest
+    needs: [smoke-tests, changelog-generation, git-tag]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish GitHub Release with auto-generated notes
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.git-tag.outputs.version }}
+          name: Release ${{ needs.git-tag.outputs.version }}
+          generate_release_notes: true
+          token: ${{ secrets.PROD_DEPLOY_KEY }}
+          body: |
+            Docker image: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:${{ needs.git-tag.outputs.version }}

@@ -1,0 +1,92 @@
+name: Deploy Staging — b5b8ffc6-929e-4f9b-96d0-d989694660af
+
+on:
+  workflow_run:
+    workflows: ['Release Candidate — b5b8ffc6-929e-4f9b-96d0-d989694660af']
+    types: [completed]
+    branches: ['release/*']
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Deployment
+        id: deployment
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ github.token }}
+          environment: staging
+
+      - name: Extract version
+        id: ver
+        # Pass the head branch via env, not direct GitHub-expression interpolation
+        # — a branch name is attacker-controllable and interpolating it into the
+        # shell is a script-injection vector (Semgrep run-shell-injection).
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          echo "version=${HEAD_BRANCH#release/}" >> $GITHUB_OUTPUT
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.8'
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: infra/terraform/envs/staging
+        env:
+          TF_VAR_image_tag: ${{ steps.ver.outputs.version }}
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+        working-directory: infra/terraform/envs/staging
+        env:
+          TF_VAR_image_tag: ${{ steps.ver.outputs.version }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+        working-directory: infra/terraform/envs/staging
+
+      - name: Blue-Green Deploy to Kubernetes
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: b5b8ffc6-929e-4f9b-96d0-d989694660af-staging
+          strategy: blue-green
+          manifests: |
+            infra/k8s/overlays/staging/
+          images: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:rc-${{ steps.ver.outputs.version }}
+
+      - name: Run smoke tests
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.STAGING_URL }}
+
+      - name: Validate monitoring health endpoint
+        run: |
+          curl --fail --retry 5 --retry-delay 10 ${{ vars.STAGING_URL }}/health
+
+      - name: Update deployment status (success)
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ github.token }}
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          state: success
+          environment-url: ${{ vars.STAGING_URL }}
+
+      - name: Update deployment status (failure)
+        if: failure()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ github.token }}
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          state: failure

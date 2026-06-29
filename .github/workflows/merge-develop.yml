@@ -1,0 +1,160 @@
+name: Merge Develop — b5b8ffc6-929e-4f9b-96d0-d989694660af
+
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+        # Dependency caching is intentionally NOT enabled here. actions/setup-node's
+        # `cache:` input fails the step ("Dependencies lock file is not found") when no
+        # package-lock.json / yarn.lock is committed — the normal state of a freshly
+        # generated repo. The install steps already fall back to `npm install` when no
+        # lockfile exists, so correctness does not depend on a cache.
+      - run: npm ci
+      - run: npm run build
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: [build]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+        # Dependency caching is intentionally NOT enabled here. actions/setup-node's
+        # `cache:` input fails the step ("Dependencies lock file is not found") when no
+        # package-lock.json / yarn.lock is committed — the normal state of a freshly
+        # generated repo. The install steps already fall back to `npm install` when no
+        # lockfile exists, so correctness does not depend on a cache.
+      - run: npm ci
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          DATABASE_URL: postgres://postgres:test@localhost:5432/testdb
+
+  e2e-test:
+    runs-on: ubuntu-latest
+    needs: [integration-test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+      - name: Start application
+        run: npm run start &
+        env:
+          PORT: 3000
+      - name: Wait for app to be ready
+        run: npx wait-on http://localhost:3000 --timeout 60000
+      - name: Run E2E tests
+        run: npx playwright test
+        env:
+          BASE_URL: http://localhost:3000
+
+  docker-publish:
+    runs-on: ubuntu-latest
+    needs: [e2e-test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set short SHA
+        id: gitsha
+        run: echo "sha7=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ghcr.io }}
+          username: ${{ github.actor }}
+          password: ${{ secrets. }}
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:develop-${{ steps.gitsha.outputs.sha7 }}
+            ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:develop-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: [docker-publish]
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set short SHA
+        id: gitsha
+        run: echo "sha7=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+      - name: Deploy to Kubernetes (dev)
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: b5b8ffc6-929e-4f9b-96d0-d989694660af-dev
+          manifests: |
+            infra/k8s/overlays/dev/
+          images: ${{ secrets.ghcr.io }}/b5b8ffc6-929e-4f9b-96d0-d989694660af:develop-${{ steps.gitsha.outputs.sha7 }}
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/b5b8ffc6-929e-4f9b-96d0-d989694660af -n b5b8ffc6-929e-4f9b-96d0-d989694660af-dev --timeout=300s
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Set kubectl context
+        uses: azure/aks-set-context@v4
+        with:
+          cluster-name: aegis-cluster
+          resource-group: ${{ vars.AZURE_RESOURCE_GROUP }}
+      - name: Run smoke tests
+        run: npm run test:smoke
+        env:
+          TARGET_URL: ${{ vars.DEV_URL }}
+      - name: Rollback on failure
+        if: failure()
+        run: kubectl rollout undo deployment/b5b8ffc6-929e-4f9b-96d0-d989694660af -n b5b8ffc6-929e-4f9b-96d0-d989694660af-dev
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [smoke-test]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets. }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "b5b8ffc6-929e-4f9b-96d0-d989694660af deployment to dev — ${{ job.status }}"
+            }
